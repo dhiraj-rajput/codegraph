@@ -1,0 +1,47 @@
+[
+  {
+    "query_id": "fastapi_arch_001",
+    "query": "How does dependency injection work in FastAPI?",
+    "category": "architecture",
+    "relevant_files": ["fastapi/dependencies/utils.py", "fastapi/dependencies/models.py", "fastapi/routing.py"],
+    "relevant_symbols": ["get_dependant", "solve_dependencies", "Dependant"],
+    "ground_truth_answer": "FastAPI uses a dependency injection system based on the Dependant model. Functions decorated with Depends() are resolved via get_dependant() which analyzes function signatures and recursively resolves sub-dependencies through solve_dependencies().",
+    "repository": "fastapi"
+  },
+  {
+    "query_id": "fastapi_arch_002",
+    "query": "How does request routing work?",
+    "category": "architecture",
+    "relevant_files": ["fastapi/routing.py", "fastapi/applications.py"],
+    "relevant_symbols": ["APIRoute", "APIRouter", "add_api_route"],
+    "ground_truth_answer": "FastAPI routing is built on Starlette. APIRouter collects route definitions via decorators (@app.get, etc.) and registers them as APIRoute objects that map URL paths to endpoint functions.",
+    "repository": "fastapi"
+  },
+  {
+    "query_id": "fastapi_dep_001",
+    "query": "What functions call get_dependant?",
+    "category": "dependency",
+    "relevant_files": ["fastapi/dependencies/utils.py", "fastapi/routing.py"],
+    "relevant_symbols": ["get_dependant", "get_request_handler", "solve_dependencies"],
+    "ground_truth_answer": "get_dependant is called by get_request_handler in routing.py and recursively by itself when resolving nested dependencies.",
+    "repository": "fastapi"
+  },
+  {
+    "query_id": "fastapi_dep_002",
+    "query": "Where is the OpenAPI schema generated?",
+    "category": "dependency",
+    "relevant_files": ["fastapi/openapi/utils.py", "fastapi/applications.py"],
+    "relevant_symbols": ["get_openapi", "openapi", "setup"],
+    "ground_truth_answer": "The OpenAPI schema is generated in fastapi/openapi/utils.py by the get_openapi() function, which is called from the FastAPI application's openapi() method.",
+    "repository": "fastapi"
+  },
+  {
+    "query_id": "fastapi_debug_001",
+    "query": "Why might authentication fail silently in FastAPI?",
+    "category": "debugging",
+    "relevant_files": ["fastapi/security/oauth2.py", "fastapi/security/http.py"],
+    "relevant_symbols": ["OAuth2PasswordBearer", "HTTPBearer", "SecurityScopes"],
+    "ground_truth_answer": "Authentication can fail silently if auto_error=False is set on OAuth2PasswordBearer or HTTPBearer, which returns None instead of raising HTTPException when credentials are missing.",
+    "repository": "fastapi"
+  }
+]

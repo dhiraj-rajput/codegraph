@@ -20,32 +20,65 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
 # Virtual environments
 .venv/
 venv/
 ENV/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Modern Python tools
+.uv/
+.python-version
+.pdm.toml
+.pdm-python
+pyrightconfig.json
 
 # IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-project
+*.sublime-workspace
 
-# Project specific data (Large files)
-data/
-results/
+# Project specific data (Large files / Binary Blobs)
+# We ignore the entire data directory but allow the directory itself
+data/**
+!data/README.md
+
+# Specific binary formats
 *.pkl
 *.db
 *.sqlite
-logs/
+*.bin
+*.index
+*.lock
+*.onnx
 
-# Secrets
+# Evaluation results
+results/
+benchmarks/eval_*.json
+
+# Secrets & Local Config
 .env
+.env.*
+!.env.example
 
-# Antigravity artifacts
-.gemini/
+# Logs
+logs/
+*.log
 
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# Antigravity artifacts
+.gemini/
+
+# Repository Storage (Cloned source code for indexing)
+repos/
+repro/

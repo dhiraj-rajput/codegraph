@@ -1,6 +1,6 @@
 # Code Graph RAG
 
-Research-grade system for comparing **Vector**, **Vectorless**, and **Hybrid** RAG on codebase retrieval.
+Research-grade local system for vectorless and hybrid RAG, fully powered by Ollama.
 
 ## Quick Start
 
@@ -40,15 +40,6 @@ Git Repository → Tree-sitter Parser → Symbol Extractor → Code Graph
 | **B: Vectorless** | query → BM25 + symbol lookup + graph expansion | No |
 | **C: Hybrid** | query → BM25 + vector + RRF + graph expansion | Yes |
 
-## Evaluation
-
-Run ablation studies with full IR metrics:
-
-```bash
-python scripts/run_experiment.py --config config/experiments.yaml
-```
-
-Metrics: Recall@K, Precision@K, MRR, nDCG, Hit@K, EM, F1, Hallucination Rate, Latency, Memory, Token Cost
 
 ## Project Structure
 

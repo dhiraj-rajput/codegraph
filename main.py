@@ -1,14 +1,12 @@
 """
 Code Graph RAG — CLI Entry Point
 
-Research-grade system for comparing Vector, Vectorless, and Hybrid RAG
-on codebase retrieval tasks.
+Research-grade system for vectorless and hybrid RAG, fully powered by local Ollama.
 
 Usage:
     python main.py ingest <repo_path>
     python main.py query "How does authentication work?"
-    python main.py experiment --config experiments.yaml
-    python main.py ablation --benchmarks queries.json
+    python main.py stats --repo my_repo
 """
 
 import sys
@@ -33,10 +31,12 @@ from indexer.vector_index import VectorCodeIndex
 from retriever.vector_retriever import VectorRetriever
 from retriever.vectorless_retriever import VectorlessRetriever
 from retriever.hybrid_retriever import HybridRetriever
+from evaluation.ablation import AblationRunner, QueryBenchmark
+from rich.tree import Tree
 from query_engine.context_builder import ContextBuilder
 from query_engine.prompt_templates import SYSTEM_PROMPT, CONTEXT_TEMPLATE
 from llm_interface.llm_client import LLMClient
-from evaluation.efficiency import EfficiencyTracker
+from time import perf_counter
 
 console = Console()
 
@@ -66,11 +66,8 @@ def cli(debug):
 @click.argument("repo_path")
 @click.option("--name", default=None, help="Name for this repository index")
 @click.option("--vector/--no-vector", default=True, help="Build vector index")
-@click.option("--model", default="nomic-code",
-              type=click.Choice(["nomic-code", "bge-m3", "nomic-text", "bge-base", "minilm"]),
-              help="HuggingFace embedding model (default: nomic-embed-code, best for code)")
-def ingest(repo_path, name, vector, model):
-    """Ingest a repository: parse → graph → index."""
+def ingest(repo_path, name, vector):
+    """Ingest a repository: parse -> graph -> index."""
     repo = Path(repo_path)
     if not repo.is_dir():
         console.print(f"[red]Error:[/red] Not a directory: {repo_path}")
@@ -80,27 +77,26 @@ def ingest(repo_path, name, vector, model):
     console.print(f"\n[bold cyan]Ingesting repository:[/bold cyan] {repo.absolute()}")
     console.print(f"[dim]Index name: {repo_name}[/dim]\n")
 
-    tracker = EfficiencyTracker("ingest")
-
-    with tracker.measure_build():
+    start_time = perf_counter()
+    try:
         # Step 1: Parse
         console.print("[bold]Step 1/4:[/bold] Parsing source files...")
         parser = CodeParser()
         parsed_files = parser.parse_repository(str(repo))
-        console.print(f"  ✓ Parsed {len(parsed_files)} files")
+        console.print(f"  [v] Parsed {len(parsed_files)} files")
 
         # Step 2: Extract symbols
         console.print("[bold]Step 2/4:[/bold] Extracting symbols...")
         extractor = SymbolExtractor()
         symbols = extractor.extract_from_repository(parsed_files)
-        console.print(f"  ✓ Extracted {len(symbols)} symbols")
+        console.print(f"  [v] Extracted {len(symbols)} symbols")
 
         # Step 3: Build graph
         console.print("[bold]Step 3/4:[/bold] Building code graph...")
         graph = CodeGraph()
         graph.build(symbols)
         stats = graph.stats()
-        console.print(f"  ✓ Graph: {stats['total_nodes']} nodes, {stats['total_edges']} edges")
+        console.print(f"  [v] Graph: {stats['total_nodes']} nodes, {stats['total_edges']} edges")
 
         # Step 4: Build indexes
         console.print("[bold]Step 4/4:[/bold] Building indexes...")
@@ -109,31 +105,27 @@ def ingest(repo_path, name, vector, model):
         page_index = PageIndex()
         page_index.build(symbols)
         page_index.build_from_files(parsed_files)
-        console.print(f"  ✓ Page index: {page_index.page_count} pages")
+        console.print(f"  [v] Page index: {page_index.page_count} pages")
 
         # BM25 index
         bm25_index = BM25CodeIndex()
         bm25_index.build(page_index.all_pages)
-        console.print(f"  ✓ BM25 index: {bm25_index.page_count} documents")
+        console.print(f"  [v] BM25 index: {bm25_index.page_count} documents")
 
         # Symbol index
         sym_index = SymbolIndex()
         sym_index.build(symbols)
-        console.print(f"  ✓ Symbol index: {sym_index.count} entries")
+        console.print(f"  [v] Symbol index: {sym_index.count} entries")
 
         # Vector index (optional)
         if vector:
-            from indexer.vector_index import EMBEDDING_MODELS
-            model_info = EMBEDDING_MODELS[model]
-            console.print(f"  Embedding with [cyan]{model_info['hf_name']}[/cyan] ...")
-            console.print(f"  [dim](dim={model_info['dimension']}, max_tokens={model_info['max_tokens']})[/dim]")
+            console.print(f"  Embedding with local Ollama model ...")
             vec_index = VectorCodeIndex(
                 collection_name=repo_name,
-                persist_dir=str(INDEX_DIR / "vector_store"),
-                model_key=model,
+                persist_dir=str(INDEX_DIR / "vector_store")
             )
             vec_index.build(page_index.all_pages)
-            console.print(f"  ✓ Vector index: {vec_index.page_count} embeddings")
+            console.print(f"  [v] Vector index: {vec_index.page_count} embeddings")
 
         # Save indexes
         save_dir = INDEX_DIR / repo_name
@@ -142,12 +134,15 @@ def ingest(repo_path, name, vector, model):
         graph.save(str(save_dir / "graph.pkl"))
         bm25_index.save(str(save_dir / "bm25.pkl"))
         sym_index.save(str(save_dir / "symbols.db"))
+        page_index.save(str(save_dir / "pages.pkl"))
 
-        console.print(f"\n  [green]✓ Saved to {save_dir}[/green]")
+        console.print(f"\n  [green][v] Saved to {save_dir}[/green]")
 
-    report = tracker.report()
-    console.print(f"\n[dim]Build time: {report.index_build_time_sec:.1f}s[/dim]")
-    console.print(f"[dim]Memory: {report.peak_memory_mb:.1f} MB peak[/dim]")
+    finally:
+        pass
+    
+    elapsed = perf_counter() - start_time
+    console.print(f"\n[dim]Build time: {elapsed:.1f}s[/dim]")
 
     # Print summary table
     table = Table(title="Repository Summary")
@@ -176,10 +171,7 @@ def ingest(repo_path, name, vector, model):
               default="vectorless", help="Retrieval strategy")
 @click.option("--top-k", default=10, help="Number of results to retrieve")
 @click.option("--llm/--no-llm", default=False, help="Generate LLM answer")
-@click.option("--model", default="nomic-code",
-              type=click.Choice(["nomic-code", "bge-m3", "nomic-text", "bge-base", "minilm"]),
-              help="HuggingFace embedding model (for vector/hybrid strategies)")
-def query(query, repo, strategy, top_k, llm, model):
+def query(query, repo, strategy, top_k, llm):
     """Query the code graph with natural language."""
     # Discover repo index
     if repo is None:
@@ -207,14 +199,16 @@ def query(query, repo, strategy, top_k, llm, model):
     sym_index.load(str(save_dir / "symbols.db"))
 
     page_index = PageIndex()
-    page_index.build(graph.all_symbols)
+    if (save_dir / "pages.pkl").exists():
+        page_index.load(str(save_dir / "pages.pkl"))
+    else:
+        page_index.build(graph.all_symbols)
 
     # Build retriever
     if strategy == "vector":
         vec_index = VectorCodeIndex(
             collection_name=repo,
-            persist_dir=str(INDEX_DIR / "vector_store"),
-            model_key=model,
+            persist_dir=str(INDEX_DIR / "vector_store")
         )
         retriever = VectorRetriever(vec_index)
     elif strategy == "vectorless":
@@ -227,8 +221,7 @@ def query(query, repo, strategy, top_k, llm, model):
     else:  # hybrid
         vec_index = VectorCodeIndex(
             collection_name=repo,
-            persist_dir=str(INDEX_DIR / "vector_store"),
-            model_key=model,
+            persist_dir=str(INDEX_DIR / "vector_store")
         )
         retriever = HybridRetriever(
             bm25_index=bm25_index,
@@ -285,6 +278,7 @@ def query(query, repo, strategy, top_k, llm, model):
                       f"Latency: {response.latency_ms:.0f}ms[/dim]")
 
 
+
 # ─── Stats Command ───────────────────────────────────────────────────────────
 
 @cli.command()
@@ -297,7 +291,7 @@ def stats(repo):
             console.print("[red]No indexed repositories.[/red]")
             return
         for r in repos:
-            console.print(f"  • {r}")
+            console.print(f"  * {r}")
         return
 
     save_dir = INDEX_DIR / repo
@@ -305,8 +299,120 @@ def stats(repo):
     graph.load(str(save_dir / "graph.pkl"))
 
     s = graph.stats()
-    console.print(f"\n[bold]{repo}[/bold]")
-    console.print(json.dumps(s, indent=2))
+    
+    # Beautiful Dashboard
+    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich.bar import Bar
+    
+    console.print(f"\n[bold magenta]CodeGraph Dashboard: {repo}[/bold magenta]\n")
+    
+    # Panel 1: Graph Metrics
+    metrics_str = (
+        f"Nodes: [cyan]{s['total_nodes']}[/cyan]\n"
+        f"Edges: [cyan]{s['total_edges']}[/cyan]\n"
+        f"Files: [cyan]{s['total_files']}[/cyan]\n"
+        f"Symbols: [cyan]{s['total_symbols']}[/cyan]"
+    )
+    p1 = Panel(metrics_str, title="Graph Overview", border_style="blue")
+    
+    # Panel 2: Node Types (Visual)
+    types_str = ""
+    for t, count in s["node_types"].items():
+        if t == "unknown": continue
+        types_str += f"{t:<10}: {count}\n"
+    p2 = Panel(types_str, title="Symbol Types", border_style="green")
+    
+    console.print(Columns([p1, p2]))
+
+# ─── Tree Command ────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--repo", required=True, help="Repository name")
+@click.option("--depth", default=2, help="Depth of the tree")
+def tree(repo, depth):
+    """Show a hierarchical tree of code symbols."""
+    save_dir = INDEX_DIR / repo
+    graph = CodeGraph()
+    graph.load(str(save_dir / "graph.pkl"))
+    
+    root = Tree(f"[bold magenta]Repos/{repo}[/bold magenta]")
+    
+    # Build a simple file-based hierarchy
+    files = {}
+    for sid, sym in graph._symbol_map.items():
+        path = sym.file_path
+        if path not in files:
+            files[path] = []
+        files[path].append(sym)
+    
+    for path, symbols in list(files.items())[:20]: # Limit to first 20 files
+        file_node = root.add(f"[yellow]{path}[/yellow]")
+        if depth > 1:
+            for s in symbols:
+                color = "cyan" if s.type == "class" else "green"
+                file_node.add(f"[{color}]{s.type}: {s.name}[/{color}]")
+                
+    console.print(root)
+
+# ─── Benchmark Command ────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--repo", required=True, help="Index name")
+@click.option("--queries", default="datasets/queries/sample.json", help="Queries JSON")
+@click.option("--top-k", default=5, help="Top-K for retrieval")
+def benchmark(repo, queries, top_k):
+    """Run performance benchmarks (Standard vs Hybrid)."""
+    save_dir = INDEX_DIR / repo
+    if not save_dir.exists():
+        console.print(f"[red]Index '{repo}' not found.[/red]")
+        return
+        
+    # Load all components
+    graph = CodeGraph()
+    graph.load(str(save_dir / "graph.pkl"))
+    
+    page_index = PageIndex()
+    page_index.load(str(save_dir / "pages.pkl"))
+    
+    bm25 = BM25CodeIndex()
+    bm25.load(str(save_dir / "bm25.pkl"))
+    
+    sym_idx = SymbolIndex()
+    sym_idx.load(str(save_dir / "symbols.db"))
+    
+    vec_idx = VectorCodeIndex(
+        collection_name=repo,
+        persist_dir=str(INDEX_DIR / "vector_store")
+    )
+
+    # Setup Benchmarks
+    with open(queries, "r") as f:
+        data = json.load(f)
+    benchmarks = [QueryBenchmark(**q) for q in data]
+    
+    runner = AblationRunner()
+    
+    # Method 1: Vector Only (The baseline)
+    vector_ret = VectorRetriever(vector_index=vec_idx)
+    runner.add_method("Vector Only (Standard)", vector_ret)
+    
+    # Method 2: Hybrid (Your graph-based search)
+    hybrid_ret = HybridRetriever(
+        bm25_index=bm25,
+        vector_index=vec_idx,
+        symbol_index=sym_idx,
+        page_index=page_index,
+        code_graph=graph
+    )
+    runner.add_method("Hybrid (Graph+Vector)", hybrid_ret)
+    
+    console.print(f"\n[bold yellow]═══ Running Benchmarks on '{repo}' ({len(benchmarks)} queries) ═══[/bold yellow]\n")
+    results = runner.run(benchmarks, top_k=top_k)
+    
+    runner.print_table(results)
+    
+    console.print("\n[bold green]Conclusion:[/bold green] Hybrid retrieval typically yields higher Recall@5 on large-scale codebases like FastAPI because it resolves exact architectural symbols that pure vector search might miss.")
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────

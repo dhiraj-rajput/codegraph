@@ -1,389 +1,206 @@
-"""
-Vector embedding index with state-of-the-art HuggingFace models.
-
-Uses community-rated best open-source models for code embedding:
-
-  Tier 1 (Recommended):
-    • nomic-ai/nomic-embed-code     — Code-specialized, trained on CoRNStack
-    • BAAI/bge-m3                   — Hybrid-ready (dense + sparse), 8192 token context
-
-  Tier 2 (Lightweight fallback):
-    • all-MiniLM-L6-v2              — Fast, CPU-friendly, general purpose
-
-Embeddings are generated locally via sentence-transformers (100% free, no API keys).
-Storage uses ChromaDB with persistent disk-backed HNSW index.
-"""
-
 import logging
 import time
-from typing import List, Optional, Dict
-from dataclasses import dataclass
+import os
+import pickle
+from typing import List, Dict, Union, Optional
 
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from concurrent.futures import ThreadPoolExecutor
+import requests  # Use requests for reliable parallel API calls
 from indexer.page_index import CodePage
 from indexer.bm25_index import ScoredPage
+from config.settings import DEFAULT_CONFIG, OLLAMA_HOST
 
 logger = logging.getLogger(__name__)
 
-
-# ─── Model Registry ─────────────────────────────────────────────────────────
-
-EMBEDDING_MODELS = {
-    # ── Tier 1: Best-in-class for code (community-rated, free, open-source) ──
-    "nomic-code": {
-        "hf_name": "nomic-ai/nomic-embed-code",
-        "dimension": 768,
-        "max_tokens": 8192,
-        "trust_remote_code": True,
-        "description": "SOTA open-source code embedding. Trained on CoRNStack code/docstring pairs.",
-        "query_prefix": "",               # No prefix needed for code model
-        "document_prefix": "",
-    },
-    "bge-m3": {
-        "hf_name": "BAAI/bge-m3",
-        "dimension": 1024,
-        "max_tokens": 8192,
-        "trust_remote_code": False,
-        "description": "Multi-modal retrieval (dense + sparse + ColBERT). MIT license.",
-        "query_prefix": "",
-        "document_prefix": "",
-    },
-
-    # ── Tier 2: Good general-purpose models with strong code performance ──
-    "nomic-text": {
-        "hf_name": "nomic-ai/nomic-embed-text-v2-moe",
-        "dimension": 768,
-        "max_tokens": 8192,
-        "trust_remote_code": True,
-        "description": "MoE text embedding. Needs search_query:/search_document: prefixes.",
-        "query_prefix": "search_query: ",
-        "document_prefix": "search_document: ",
-    },
-    "bge-base": {
-        "hf_name": "BAAI/bge-base-en-v1.5",
-        "dimension": 768,
-        "max_tokens": 512,
-        "trust_remote_code": False,
-        "description": "Solid all-rounder. Smaller footprint than bge-m3.",
-        "query_prefix": "Represent this sentence: ",
-        "document_prefix": "",
-    },
-
-    # ── Tier 3: Lightweight / CPU fallback ──
-    "minilm": {
-        "hf_name": "sentence-transformers/all-MiniLM-L6-v2",
-        "dimension": 384,
-        "max_tokens": 256,
-        "trust_remote_code": False,
-        "description": "Tiny, fast, CPU-friendly. Use for prototyping only.",
-        "query_prefix": "",
-        "document_prefix": "",
-    },
-}
-
-DEFAULT_MODEL = "nomic-code"   # Best free model for code retrieval
-
-
-# ─── Embedding Engine ────────────────────────────────────────────────────────
-
-class HuggingFaceEmbedder:
-    """
-    Wraps sentence-transformers to embed code with any HuggingFace model.
-
-    Loads models lazily, caches them, and handles query/document prefixes.
-    100% local, 100% free — no API keys needed.
-    """
-
-    def __init__(self, model_key: str = DEFAULT_MODEL):
-        self._model_key = model_key
-        self._model_info = EMBEDDING_MODELS[model_key]
-        self._model = None
-        self._load_time_sec = 0.0
-
-    def _load_model(self):
-        """Lazy-load the sentence-transformers model."""
-        if self._model is not None:
-            return
-
-        from sentence_transformers import SentenceTransformer
-        import torch
-
-        hf_name = self._model_info["hf_name"]
-        trust = self._model_info.get("trust_remote_code", False)
-
-        # Auto-detect best device
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
-        logger.info(f"Loading embedding model: {hf_name} on {device} ...")
-        start = time.perf_counter()
-
-        self._model = SentenceTransformer(
-            hf_name,
-            device=device,
-            trust_remote_code=trust,
-        )
-
-        self._load_time_sec = time.perf_counter() - start
-        logger.info(
-            f"Loaded {hf_name} in {self._load_time_sec:.1f}s "
-            f"(dim={self._model_info['dimension']})"
-        )
-
-    @property
-    def dimension(self) -> int:
-        return self._model_info["dimension"]
-
-    @property
-    def model_name(self) -> str:
-        return self._model_info["hf_name"]
-
-    def embed_documents(
-        self,
-        texts: List[str],
-        batch_size: int = 8,
-        use_parallel: bool = False
-    ) -> List[List[float]]:
-        """Embed a list of documents (code pages)."""
-        self._load_model()
-
-        # Truncate texts to avoid OOM on long code pages.
-        # Approximate max chars as max_tokens * 4 (avg chars per token).
-        max_chars = self._model_info.get("max_tokens", 8192) * 4
-        texts = [t[:max_chars] for t in texts]
-
-        prefix = self._model_info.get("document_prefix", "")
-        if prefix:
-            texts = [prefix + t for t in texts]
-
-        if use_parallel and self._model.device.type == "cpu":
-            # Multi-process encoding for CPU speedup
-            logger.info(f"Starting multi-process pool for {len(texts)} documents...")
-            pool = self._model.start_multi_process_pool()
-            embeddings = self._model.encode_multi_process(
-                texts,
-                pool,
-                batch_size=batch_size,
-            )
-            self._model.stop_multi_process_pool(pool)
-        else:
-            # Sequential encoding (standard)
-            embeddings = self._model.encode(
-                texts,
-                batch_size=batch_size,
-                show_progress_bar=len(texts) > 100,
-                normalize_embeddings=True,
-                truncate_dim=self._model_info["dimension"],
-            )
-
-        return embeddings.tolist()
-
-    def embed_query(self, query: str) -> List[float]:
-        """Embed a single query."""
-        self._load_model()
-
-        prefix = self._model_info.get("query_prefix", "")
-        text = prefix + query if prefix else query
-
-        embedding = self._model.encode(
-            [text],
-            normalize_embeddings=True,
-        )
-        return embedding[0].tolist()
-
-
-# ─── ChromaDB + HuggingFace Integration ─────────────────────────────────────
-
 try:
-    from chromadb import EmbeddingFunction
+    import chromadb
+    from chromadb.utils import embedding_functions
+    CHROMA_AVAILABLE = True
 except ImportError:
-    EmbeddingFunction = object
-
-class ChromaHFEmbeddingFunction(EmbeddingFunction):
-    """
-    Adapter that plugs our HuggingFaceEmbedder into ChromaDB's
-    embedding_function interface.
-    """
-
-    def __init__(self, embedder: HuggingFaceEmbedder):
-        self._embedder = embedder
-
-    def __call__(self, input: List[str]) -> List[List[float]]:
-        return self._embedder.embed_documents(input)
-
-
-# ─── Vector Index ────────────────────────────────────────────────────────────
+    CHROMA_AVAILABLE = False
+    from indexer.fallback_vector_index import NumpyVectorIndex
 
 class VectorCodeIndex:
     """
-    Vector embedding index for code pages.
-
-    Uses state-of-the-art open-source models from HuggingFace:
-      • nomic-ai/nomic-embed-code  (default — best for code)
-      • BAAI/bge-m3                (hybrid-ready alternative)
-      • all-MiniLM-L6-v2           (lightweight fallback)
-
-    Storage: ChromaDB with persistent HNSW index on disk.
-    All computation is local — no API keys or cloud services needed.
+    Unified Vector Index. Prefers ChromaDB, falls back to Numpy.
     """
 
     def __init__(
         self,
         collection_name: str = "code_pages",
         persist_dir: str = "./data/vector_store",
-        model_key: str = DEFAULT_MODEL,
+        model_name: str = None,
     ):
         self._collection_name = collection_name
         self._persist_dir = persist_dir
-        self._model_key = model_key
-        self._embedder = HuggingFaceEmbedder(model_key)
-        self._collection = None
+        self._model_name = model_name or DEFAULT_CONFIG.embedding.model_name
+        self._impl = None
         self._pages_map: Dict[str, CodePage] = {}
-        self._initialized = False
+        self._map_path = os.path.join(persist_dir, f"{collection_name}_map.pkl")
+        
+        if CHROMA_AVAILABLE:
+            try:
+                self._init_chromadb()
+                if os.path.exists(self._map_path):
+                    self._load_map()
+            except Exception as e:
+                logger.warning(f"ChromaDB hardware/binary error: {e}. Falling back to Numpy.")
+                self._impl = NumpyVectorIndex(collection_name, persist_dir, model_name)
+        else:
+            logger.info("ChromaDB not installed. Using Numpy fallback.")
+            self._impl = NumpyVectorIndex(collection_name, persist_dir, model_name)
 
     def _init_chromadb(self):
-        """Initialize ChromaDB client and collection with our HF embedder."""
-        if self._initialized:
-            return
+        self._client = chromadb.PersistentClient(path=self._persist_dir)
+        embed_fn = embedding_functions.OllamaEmbeddingFunction(
+            url=f"{OLLAMA_HOST}/api/embeddings",
+            model_name=self._model_name,
+        )
+        self._collection = self._client.get_or_create_collection(
+            name=self._collection_name,
+            metadata={"hnsw:space": "cosine"},
+            embedding_function=embed_fn,
+        )
 
+    def _save_map(self):
+        os.makedirs(os.path.dirname(self._map_path), exist_ok=True)
+        with open(self._map_path, 'wb') as f:
+            pickle.dump(self._pages_map, f)
+
+    def _load_map(self):
         try:
-            import chromadb
-
-            self._client = chromadb.PersistentClient(path=self._persist_dir)
-
-            # Create embedding function adapter
-            embed_fn = ChromaHFEmbeddingFunction(self._embedder)
-
-            self._collection = self._client.get_or_create_collection(
-                name=self._collection_name,
-                metadata={"hnsw:space": "cosine"},
-                embedding_function=embed_fn,
-            )
-            self._initialized = True
-            logger.info(
-                f"ChromaDB initialized with model: {self._embedder.model_name}"
-            )
-
-        except ImportError:
-            logger.warning("ChromaDB not installed — vector index disabled")
-            self._initialized = False
+            with open(self._map_path, 'rb') as f:
+                self._pages_map = pickle.load(f)
         except Exception as e:
-            logger.warning(f"ChromaDB initialization failed: {e}")
-            self._initialized = False
+            logger.warning(f"Failed to load page map: {e}")
 
-    def build(self, pages: List[CodePage], batch_size: int = 8, use_parallel: bool = False):
+    def _get_batch_embeddings(self, texts: List[str], timeout: int = 180) -> List[List[float]]:
+        """Fetch embeddings for a batch of texts from Ollama."""
+        url = f"{OLLAMA_HOST}/api/embed"
+        payload = {"model": self._model_name, "input": texts}
+        response = requests.post(url, json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json()["embeddings"]
+
+    def _safe_embed_batch(self, batch_pages: List[CodePage], current_batch_size: int) -> List[List[float]]:
         """
-        Build the vector index from code pages.
-
-        Embeds each page's searchable_text using the configured HuggingFace model,
-        then stores embeddings + metadata in ChromaDB.
+        Recursively attempts to embed a batch, scaling down on failure.
         """
-        self._init_chromadb()
-        if not self._initialized:
-            logger.warning("Vector index not available, skipping build")
-            return
+        texts = [p.searchable_text[:6000] for p in batch_pages]
+        
+        try:
+            return self._get_batch_embeddings(texts)
+        except (requests.exceptions.RequestException, Exception) as e:
+            if current_batch_size <= 1:
+                logger.error(f"Atomic embedding failure for {batch_pages[0].page_id}: {e}")
+                return [[0.0] * 768]
+            
+            new_size = max(1, current_batch_size // 2)
+            logger.warning(f"Ollama pressure detected. Scaling down: {current_batch_size} -> {new_size}")
+            
+            # Split and recurse
+            mid = len(batch_pages) // 2
+            left_batch = batch_pages[:mid]
+            right_batch = batch_pages[mid:]
+            
+            left_embs = self._safe_embed_batch(left_batch, new_size)
+            right_embs = self._safe_embed_batch(right_batch, new_size)
+            
+            return left_embs + right_embs
 
-        # Store page lookup
-        for page in pages:
-            self._pages_map[page.page_id] = page
-
+    def build(self, pages: List[CodePage], batch_size: int = None):
+        if self._impl:
+            return self._impl.build(pages, batch_size)
+            
+        cfg = DEFAULT_CONFIG.embedding
+        batch_size = batch_size or cfg.batch_size
+        max_workers = cfg.max_workers
+        
+        # Silence noisy HTTP logs
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("requests").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+            
         # Clear existing collection
         try:
-            existing = self._collection.count()
-            if existing > 0:
-                all_ids = self._collection.get()["ids"]
-                if all_ids:
-                    self._collection.delete(ids=all_ids)
-        except Exception:
+            if self._collection.count() > 0:
+                self._collection.delete(ids=self._collection.get()["ids"])
+        except:
             pass
 
-        # Pre-compute embeddings with the HF model (for progress tracking)
-        logger.info(
-            f"Embedding {len(pages)} pages with {self._embedder.model_name}..."
-        )
+        self._pages_map = {p.page_id: p for p in pages}
+        self._save_map()
+
         start = time.perf_counter()
-
-        all_texts = [p.searchable_text for p in pages]
-        all_embeddings = self._embedder.embed_documents(
-            all_texts,
-            batch_size=batch_size,
-            use_parallel=use_parallel
-        )
-
-        embed_time = time.perf_counter() - start
-        logger.info(f"Embedding complete in {embed_time:.1f}s")
-
-        # Add to ChromaDB in batches (with pre-computed embeddings)
+        
+        # Prepare batches
+        batches = []
         for i in range(0, len(pages), batch_size):
-            batch_pages = pages[i:i + batch_size]
-            batch_embeddings = all_embeddings[i:i + batch_size]
+            batches.append(pages[i:i + batch_size])
 
-            self._collection.add(
-                ids=[p.page_id for p in batch_pages],
-                embeddings=batch_embeddings,
-                documents=[p.searchable_text for p in batch_pages],
-                metadatas=[
-                    {
-                        "symbol_name": p.symbol_name,
-                        "symbol_type": p.symbol_type,
-                        "file_path": p.file_path,
-                        "line_start": p.line_start,
-                        "line_end": p.line_end,
-                    }
-                    for p in batch_pages
-                ],
-            )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=logging.getLogger("code_graph_rag").handlers[0].console if logging.getLogger("code_graph_rag").handlers else None
+        ) as progress:
+            task = progress.add_task(f"[cyan]Embedding {len(pages)} pages (Turbo Mode, {max_workers} threads)...", total=len(pages))
+            
+            def process_batch(batch_pages):
+                embeddings = self._safe_embed_batch(batch_pages, len(batch_pages))
+                texts = [p.searchable_text[:6000] for p in batch_pages]
+                
+                self._collection.add(
+                    ids=[p.page_id for p in batch_pages],
+                    embeddings=embeddings,
+                    documents=texts,
+                    metadatas=[
+                        {
+                            "symbol_name": p.symbol_name,
+                            "symbol_type": p.symbol_type,
+                            "file_path": p.file_path,
+                            "line_start": p.line_start,
+                            "line_end": p.line_end,
+                        }
+                        for p in batch_pages
+                    ],
+                )
+                progress.update(task, advance=len(batch_pages))
 
-        logger.info(
-            f"Built vector index: {len(pages)} pages, "
-            f"model={self._embedder.model_name}, "
-            f"dim={self._embedder.dimension}"
-        )
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                executor.map(process_batch, batches)
+                
+        logger.info(f"Built Chroma vector index (Parallel) in {time.perf_counter() - start:.1f}s")
 
     def search(self, query: str, top_k: int = 10) -> List[ScoredPage]:
-        """
-        Semantic similarity search using the HuggingFace embedding model.
-
-        Embeds the query with the same model used for indexing, then
-        searches ChromaDB for nearest neighbors by cosine similarity.
-        """
-        if not self._initialized:
-            self._init_chromadb()
-        if not self._initialized or self._collection is None:
-            return []
-
+        if self._impl:
+            return self._impl.search(query, top_k)
+            
         try:
-            # Embed query with our HF model
-            query_embedding = self._embedder.embed_query(query)
-
-            results = self._collection.query(
-                query_embeddings=[query_embedding],
-                n_results=min(top_k, max(self._collection.count(), 1)),
-            )
+            # Truncate query too
+            results = self._collection.query(query_texts=[query[:6000]], n_results=top_k)
+            scored_pages = []
+            
+            if results and results["ids"] and results["ids"][0]:
+                ids = results["ids"][0]
+                distances = results["distances"][0] if results["distances"] else [0.0] * len(ids)
+                
+                for pid, dist in zip(ids, distances):
+                    page = self._pages_map.get(pid)
+                    if page:
+                        similarity = max(0.0, 1.0 - dist)
+                        scored_pages.append(ScoredPage(
+                            page=page,
+                            score=float(similarity),
+                            source="vector_chroma"
+                        ))
+            return scored_pages
         except Exception as e:
-            logger.warning(f"Vector search failed: {e}")
+            logger.error(f"Vector search failed: {e}")
             return []
-
-        scored_pages = []
-        if results and results["ids"] and results["ids"][0]:
-            ids = results["ids"][0]
-            distances = results["distances"][0] if results["distances"] else [0.0] * len(ids)
-
-            for page_id, distance in zip(ids, distances):
-                page = self._pages_map.get(page_id)
-                if page:
-                    # ChromaDB returns cosine distances; convert to similarity
-                    similarity = max(0.0, 1.0 - distance)
-                    scored_pages.append(ScoredPage(
-                        page=page,
-                        score=similarity,
-                        source="vector",
-                    ))
-
-        return scored_pages
 
     def get_scores(self, query: str, top_k: int = 100) -> List[tuple]:
         """Get vector similarity scores for all pages (for hybrid fusion)."""
@@ -392,16 +209,5 @@ class VectorCodeIndex:
 
     @property
     def page_count(self) -> int:
-        if self._initialized and self._collection:
-            return self._collection.count()
-        return 0
-
-    @property
-    def model_info(self) -> dict:
-        """Return info about the active embedding model."""
-        return {
-            "key": self._model_key,
-            "hf_name": self._embedder.model_name,
-            "dimension": self._embedder.dimension,
-            **EMBEDDING_MODELS[self._model_key],
-        }
+        if self._impl: return self._impl.page_count
+        return self._collection.count() if self._collection else 0

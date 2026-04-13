@@ -1,66 +1,28 @@
 [project]
 name = "code-graph-rag"
-version = "0.1.0"
-description = "Research-grade system for comparing Vector, Vectorless, and Hybrid RAG on codebases"
+version = "0.2.0"
+description = "Local RAG for codebases, fully powered by Ollama"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    # Core parsing
     "tree-sitter>=0.23.0,<1.0",
     "tree-sitter-python>=0.23.0",
     "tree-sitter-javascript>=0.23.0",
-
-    # Graph
     "networkx>=3.2",
-
-    # BM25 / Sparse retrieval
     "rank-bm25>=0.2.2",
     "scikit-learn>=1.5",
-
-    # Vector store + HuggingFace embeddings (all free, all local)
     "chromadb>=0.5.0",
-    "sentence-transformers>=3.0",
-    "torch>=2.2",
-    "transformers>=4.40",
-    "einops>=0.8",                    # Required by nomic models
-
-    # LLM clients
-    "openai>=1.50",
-    "anthropic>=0.40",
-    "google-generativeai>=0.8.0",
-
-    # Utilities
+    "ollama>=0.4.7",
     "click>=8.1",
     "pyyaml>=6.0",
-    "tiktoken>=0.7",
     "rich>=13.7",
     "tqdm>=4.66",
     "psutil>=5.9",
     "python-dotenv>=1.0.0",
-
-    # Evaluation / Stats
-    "scipy>=1.13",
-    "numpy>=1.26",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-cov>=5.0",
-    "ruff>=0.5",
 ]
 
 [project.scripts]
 cgrag = "main:cli"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-addopts = "-v --tb=short"
-
 [tool.setuptools]
-packages = ["config", "parser", "indexer", "graph_builder", "retriever", "query_engine", "llm_interface", "evaluation"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py310"
+packages = ["config", "parser", "indexer", "graph_builder", "retriever", "query_engine", "llm_interface"]

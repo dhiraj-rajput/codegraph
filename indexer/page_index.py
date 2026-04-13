@@ -173,3 +173,28 @@ class PageIndex:
     @property
     def page_count(self) -> int:
         return len(self._pages)
+
+    def save(self, path: str):
+        """Save PageIndex to disk."""
+        import pickle
+        with open(path, "wb") as f:
+            pickle.dump(self._pages, f)
+
+    def load(self, path: str):
+        """Load PageIndex from disk."""
+        import pickle
+        with open(path, "rb") as f:
+            self._pages = pickle.load(f)
+        
+        # Rebuild lookup maps
+        self._by_symbol.clear()
+        self._by_file.clear()
+        self._by_name.clear()
+        for pid, page in self._pages.items():
+            self._by_symbol[page.symbol_id] = pid
+            if page.file_path not in self._by_file:
+                self._by_file[page.file_path] = []
+            self._by_file[page.file_path].append(pid)
+            if page.symbol_name not in self._by_name:
+                self._by_name[page.symbol_name] = []
+            self._by_name[page.symbol_name].append(pid)

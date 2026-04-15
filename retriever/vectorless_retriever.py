@@ -255,13 +255,13 @@ class VectorlessRetriever(BaseRetriever):
             score = 0.0
 
             if pid in bm25_ranks:
-                score += dyn_bm25_w * (1.0 / (k + bm25_ranks[pid]))
+                score += dyn_bm25_w * (1.0 / (k + bm25_ranks[pid] + 1))
 
             if pid in sym_ranks:
-                score += dyn_sym_w * (1.0 / (k + sym_ranks[pid]))
+                score += dyn_sym_w * (1.0 / (k + sym_ranks[pid] + 1))
 
             if pid in graph_ranks:
-                score += dyn_graph_w * (1.0 / (k + graph_ranks[pid]))
+                score += dyn_graph_w * (1.0 / (k + graph_ranks[pid] + 1))
 
             if score > 0:
                 page = self._pages.get_page(pid)

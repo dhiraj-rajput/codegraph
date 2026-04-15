@@ -7,7 +7,9 @@ semantically meaningful code boundaries.
 """
 
 import hashlib
-from dataclasses import dataclass, field
+import json
+import pickle
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Dict
 
 from parser.symbol_extractor import CodeSymbol
@@ -175,16 +177,21 @@ class PageIndex:
         return len(self._pages)
 
     def save(self, path: str):
-        """Save PageIndex to disk."""
-        import pickle
-        with open(path, "wb") as f:
-            pickle.dump(self._pages, f)
+        """Save PageIndex to disk as JSON (safer than pickle)."""
+        data = {pid: asdict(page) for pid, page in self._pages.items()}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
 
     def load(self, path: str):
         """Load PageIndex from disk."""
-        import pickle
-        with open(path, "rb") as f:
-            self._pages = pickle.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self._pages = {pid: CodePage(**page) for pid, page in raw.items()}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Backward compatibility for old pickle indexes.
+            with open(path, "rb") as f:
+                self._pages = pickle.load(f)
         
         # Rebuild lookup maps
         self._by_symbol.clear()

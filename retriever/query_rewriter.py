@@ -9,6 +9,7 @@ import json
 import logging
 from typing import List
 from dataclasses import dataclass
+from functools import lru_cache
 
 from config.settings import DEFAULT_CONFIG, OLLAMA_HOST
 
@@ -65,6 +66,10 @@ class LLMQueryExpander:
         """
         Rewrite the query using Ollama. Fallback to basic extraction if unavailable.
         """
+        return self._expand_cached(query)
+
+    @lru_cache(maxsize=256)
+    def _expand_cached(self, query: str) -> ExpandedQuery:
         self._init_client()
         if self._client is None:
             return self._fallback(query)

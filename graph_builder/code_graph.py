@@ -352,20 +352,25 @@ class CodeGraph:
     # ── Persistence ──────────────────────────────────────────────────────
 
     def save(self, path: str):
-        """Save graph + cached PageRank to disk."""
+        """Save graph + cached PageRank to disk as JSON."""
         data = {
             "graph": nx.node_link_data(self.graph),
             "symbols": {sid: self._symbol_to_dict(sym) for sid, sym in self._symbol_map.items()},
             "pagerank": self._cached_pagerank,
         }
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
         logger.info(f"Saved graph to {path}")
 
     def load(self, path: str):
         """Load graph + cached PageRank from disk."""
-        with open(path, "rb") as f:
-            data = pickle.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Backward compatibility for old pickle graphs.
+            with open(path, "rb") as f:
+                data = pickle.load(f)
 
         self.graph = nx.node_link_graph(data["graph"])
         self._symbol_map = {

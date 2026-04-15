@@ -39,6 +39,7 @@ class NumpyVectorIndex:
         self.embeddings: Optional[np.ndarray] = None
         self.page_ids: List[str] = []
         self.pages_map: Dict[str, CodePage] = {}
+        self._http = requests.Session()
 
         if os.path.exists(self._save_path):
             self.load()
@@ -47,7 +48,7 @@ class NumpyVectorIndex:
         """Fetch embeddings for a batch of texts from Ollama."""
         url = f"{OLLAMA_HOST}/api/embed"
         payload = {"model": self._model_name, "input": texts}
-        response = requests.post(url, json=payload, timeout=timeout)
+        response = self._http.post(url, json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()["embeddings"]
 

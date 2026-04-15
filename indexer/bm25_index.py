@@ -9,9 +9,10 @@ Code-aware tokenization: splits camelCase, snake_case, preserves identifiers.
 
 import re
 import logging
+import json
 import pickle
 from typing import List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from indexer.page_index import CodePage
 
@@ -220,22 +221,30 @@ class BM25CodeIndex:
             return [(self._pages[i].page_id, float(s)) for i, s in enumerate(scores)]
 
     def save(self, path: str):
-        """Save BM25 index to disk."""
+        """Save BM25 index metadata to disk as JSON."""
         data = {
             "tokenized_corpus": self._tokenized_corpus,
-            "pages": self._pages,
+            "pages": [asdict(p) for p in self._pages],
             "use_bm25s": self._use_bm25s,
         }
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
 
     def load(self, path: str):
-        """Load BM25 index from disk."""
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        self._pages = data["pages"]
-        self._tokenized_corpus = data["tokenized_corpus"]
-        self._use_bm25s = data.get("use_bm25s", False) and BM25S_AVAILABLE
+        """Load BM25 index metadata from disk."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._pages = [CodePage(**p) for p in data["pages"]]
+            self._tokenized_corpus = data["tokenized_corpus"]
+            self._use_bm25s = data.get("use_bm25s", False) and BM25S_AVAILABLE
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Backward compatibility for old pickle indexes.
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            self._pages = data["pages"]
+            self._tokenized_corpus = data["tokenized_corpus"]
+            self._use_bm25s = data.get("use_bm25s", False) and BM25S_AVAILABLE
 
         if self._use_bm25s:
             self._bm25 = bm25s.BM25()

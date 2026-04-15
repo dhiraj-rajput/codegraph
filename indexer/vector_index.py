@@ -1,9 +1,11 @@
 import logging
 import time
 import os
+import json
 import pickle
 import threading
 from typing import List, Dict, Optional
+from dataclasses import asdict
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from concurrent.futures import ThreadPoolExecutor
@@ -39,8 +41,9 @@ class VectorCodeIndex:
         self._model_name = model_name or DEFAULT_CONFIG.embedding.model_name
         self._impl = None
         self._pages_map: Dict[str, CodePage] = {}
-        self._map_path = os.path.join(persist_dir, f"{collection_name}_map.pkl")
+        self._map_path = os.path.join(persist_dir, f"{collection_name}_map.json")
         self._write_lock = threading.Lock()  # Thread-safe ChromaDB writes
+        self._http = requests.Session()
 
         if CHROMA_AVAILABLE:
             try:
@@ -68,21 +71,31 @@ class VectorCodeIndex:
 
     def _save_map(self):
         os.makedirs(os.path.dirname(self._map_path), exist_ok=True)
-        with open(self._map_path, 'wb') as f:
-            pickle.dump(self._pages_map, f)
+        serializable = {pid: asdict(page) for pid, page in self._pages_map.items()}
+        with open(self._map_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f)
 
     def _load_map(self):
         try:
-            with open(self._map_path, 'rb') as f:
-                self._pages_map = pickle.load(f)
+            with open(self._map_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self._pages_map = {pid: CodePage(**page) for pid, page in raw.items()}
         except Exception as e:
+            old_map_path = self._map_path.replace(".json", ".pkl")
+            if os.path.exists(old_map_path):
+                try:
+                    with open(old_map_path, "rb") as f:
+                        self._pages_map = pickle.load(f)
+                    return
+                except Exception:
+                    pass
             logger.warning(f"Failed to load page map: {e}")
 
     def _get_batch_embeddings(self, texts: List[str], timeout: int = 180) -> List[List[float]]:
         """Fetch embeddings for a batch of texts from Ollama."""
         url = f"{OLLAMA_HOST}/api/embed"
         payload = {"model": self._model_name, "input": texts}
-        response = requests.post(url, json=payload, timeout=timeout)
+        response = self._http.post(url, json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()["embeddings"]
 

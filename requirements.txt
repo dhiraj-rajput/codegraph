@@ -6,21 +6,19 @@ tree-sitter-javascript==0.23.1
 # Graph
 networkx==3.4.2
 
-# BM25 / Sparse retrieval
+# BM25 / Sparse retrieval (bm25s is 500x faster via sparse matrices)
+bm25s>=0.2.0
 rank-bm25==0.2.2
-scikit-learn==1.6.1
 
 # Vector store
 chromadb==0.6.3
 
-# LLM clients
+# LLM clients (Ollama-only)
 ollama==0.4.7
 
 # Utilities
 click==8.1.8
-pyyaml==6.0.2
 rich==13.9.4
-tqdm==4.67.1
-psutil==6.1.1
 numpy>=1.26
 python-dotenv>=1.0.0
+requests>=2.31.0

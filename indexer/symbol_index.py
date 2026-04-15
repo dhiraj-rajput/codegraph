@@ -162,8 +162,9 @@ class SymbolIndex:
                   WHERE {' OR '.join(conditions)}
                   GROUP BY symbol_id
                   ORDER BY match_count DESC, length(name) ASC
-                  LIMIT {top_k}"""
+                  LIMIT ?"""
 
+        params = tuple(params) + (int(top_k),)
         cursor = self._conn.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
 

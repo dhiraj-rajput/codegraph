@@ -12,8 +12,8 @@ Usage:
 import sys
 import json
 import logging
-import time
 from pathlib import Path
+from time import perf_counter
 
 import click
 from rich.console import Console
@@ -36,7 +36,6 @@ from rich.tree import Tree
 from query_engine.context_builder import ContextBuilder
 from query_engine.prompt_templates import SYSTEM_PROMPT, CONTEXT_TEMPLATE
 from llm_interface.llm_client import LLMClient
-from time import perf_counter
 
 console = Console()
 
@@ -68,13 +67,13 @@ def cli(debug):
 @click.option("--vector/--no-vector", default=True, help="Build vector index")
 def ingest(repo_path, name, vector):
     """Ingest a repository: parse -> graph -> index."""
-    repo = Path(repo_path)
+    repo = Path(repo_path).resolve()
     if not repo.is_dir():
         console.print(f"[red]Error:[/red] Not a directory: {repo_path}")
         sys.exit(1)
 
     repo_name = name or repo.name
-    console.print(f"\n[bold cyan]Ingesting repository:[/bold cyan] {repo.absolute()}")
+    console.print(f"\n[bold cyan]Ingesting repository:[/bold cyan] {repo}")
     console.print(f"[dim]Index name: {repo_name}[/dim]\n")
 
     start_time = perf_counter()
@@ -138,11 +137,12 @@ def ingest(repo_path, name, vector):
 
         console.print(f"\n  [green][v] Saved to {save_dir}[/green]")
 
+    except Exception as e:
+        console.print(f"\n[red]Ingest failed: {e}[/red]")
+        raise
     finally:
-        pass
-    
-    elapsed = perf_counter() - start_time
-    console.print(f"\n[dim]Build time: {elapsed:.1f}s[/dim]")
+        elapsed = perf_counter() - start_time
+        console.print(f"\n[dim]Build time: {elapsed:.1f}s[/dim]")
 
     # Print summary table
     table = Table(title="Repository Summary")
@@ -299,14 +299,13 @@ def stats(repo):
     graph.load(str(save_dir / "graph.pkl"))
 
     s = graph.stats()
-    
+
     # Beautiful Dashboard
     from rich.panel import Panel
     from rich.columns import Columns
-    from rich.bar import Bar
-    
+
     console.print(f"\n[bold magenta]CodeGraph Dashboard: {repo}[/bold magenta]\n")
-    
+
     # Panel 1: Graph Metrics
     metrics_str = (
         f"Nodes: [cyan]{s['total_nodes']}[/cyan]\n"
@@ -315,14 +314,14 @@ def stats(repo):
         f"Symbols: [cyan]{s['total_symbols']}[/cyan]"
     )
     p1 = Panel(metrics_str, title="Graph Overview", border_style="blue")
-    
+
     # Panel 2: Node Types (Visual)
     types_str = ""
     for t, count in s["node_types"].items():
         if t == "unknown": continue
         types_str += f"{t:<10}: {count}\n"
     p2 = Panel(types_str, title="Symbol Types", border_style="green")
-    
+
     console.print(Columns([p1, p2]))
 
 # ─── Tree Command ────────────────────────────────────────────────────────────
@@ -335,9 +334,9 @@ def tree(repo, depth):
     save_dir = INDEX_DIR / repo
     graph = CodeGraph()
     graph.load(str(save_dir / "graph.pkl"))
-    
+
     root = Tree(f"[bold magenta]Repos/{repo}[/bold magenta]")
-    
+
     # Build a simple file-based hierarchy
     files = {}
     for sid, sym in graph._symbol_map.items():
@@ -345,14 +344,14 @@ def tree(repo, depth):
         if path not in files:
             files[path] = []
         files[path].append(sym)
-    
+
     for path, symbols in list(files.items())[:20]: # Limit to first 20 files
         file_node = root.add(f"[yellow]{path}[/yellow]")
         if depth > 1:
             for s in symbols:
                 color = "cyan" if s.type == "class" else "green"
                 file_node.add(f"[{color}]{s.type}: {s.name}[/{color}]")
-                
+
     console.print(root)
 
 # ─── Benchmark Command ────────────────────────────────────────────────────────
@@ -367,20 +366,20 @@ def benchmark(repo, queries, top_k):
     if not save_dir.exists():
         console.print(f"[red]Index '{repo}' not found.[/red]")
         return
-        
+
     # Load all components
     graph = CodeGraph()
     graph.load(str(save_dir / "graph.pkl"))
-    
+
     page_index = PageIndex()
     page_index.load(str(save_dir / "pages.pkl"))
-    
+
     bm25 = BM25CodeIndex()
     bm25.load(str(save_dir / "bm25.pkl"))
-    
+
     sym_idx = SymbolIndex()
     sym_idx.load(str(save_dir / "symbols.db"))
-    
+
     vec_idx = VectorCodeIndex(
         collection_name=repo,
         persist_dir=str(INDEX_DIR / "vector_store")
@@ -390,13 +389,13 @@ def benchmark(repo, queries, top_k):
     with open(queries, "r") as f:
         data = json.load(f)
     benchmarks = [QueryBenchmark(**q) for q in data]
-    
+
     runner = AblationRunner()
-    
+
     # Method 1: Vector Only (The baseline)
     vector_ret = VectorRetriever(vector_index=vec_idx)
     runner.add_method("Vector Only (Standard)", vector_ret)
-    
+
     # Method 2: Hybrid (Your graph-based search)
     hybrid_ret = HybridRetriever(
         bm25_index=bm25,
@@ -406,12 +405,12 @@ def benchmark(repo, queries, top_k):
         code_graph=graph
     )
     runner.add_method("Hybrid (Graph+Vector)", hybrid_ret)
-    
+
     console.print(f"\n[bold yellow]═══ Running Benchmarks on '{repo}' ({len(benchmarks)} queries) ═══[/bold yellow]\n")
     results = runner.run(benchmarks, top_k=top_k)
-    
+
     runner.print_table(results)
-    
+
     console.print("\n[bold green]Conclusion:[/bold green] Hybrid retrieval typically yields higher Recall@5 on large-scale codebases like FastAPI because it resolves exact architectural symbols that pure vector search might miss.")
 
 

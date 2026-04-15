@@ -2,11 +2,12 @@ import logging
 import time
 import os
 import pickle
-from typing import List, Dict, Union, Optional
+import threading
+from typing import List, Dict, Optional
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from concurrent.futures import ThreadPoolExecutor
-import requests  # Use requests for reliable parallel API calls
+import requests
 from indexer.page_index import CodePage
 from indexer.bm25_index import ScoredPage
 from config.settings import DEFAULT_CONFIG, OLLAMA_HOST
@@ -24,6 +25,7 @@ except ImportError:
 class VectorCodeIndex:
     """
     Unified Vector Index. Prefers ChromaDB, falls back to Numpy.
+    Thread-safe for parallel embedding builds.
     """
 
     def __init__(
@@ -38,7 +40,8 @@ class VectorCodeIndex:
         self._impl = None
         self._pages_map: Dict[str, CodePage] = {}
         self._map_path = os.path.join(persist_dir, f"{collection_name}_map.pkl")
-        
+        self._write_lock = threading.Lock()  # Thread-safe ChromaDB writes
+
         if CHROMA_AVAILABLE:
             try:
                 self._init_chromadb()
@@ -53,14 +56,14 @@ class VectorCodeIndex:
 
     def _init_chromadb(self):
         self._client = chromadb.PersistentClient(path=self._persist_dir)
-        embed_fn = embedding_functions.OllamaEmbeddingFunction(
+        self._embed_fn = embedding_functions.OllamaEmbeddingFunction(
             url=f"{OLLAMA_HOST}/api/embeddings",
             model_name=self._model_name,
         )
         self._collection = self._client.get_or_create_collection(
             name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
-            embedding_function=embed_fn,
+            embedding_function=self._embed_fn,
         )
 
     def _save_map(self):
@@ -88,52 +91,54 @@ class VectorCodeIndex:
         Recursively attempts to embed a batch, scaling down on failure.
         """
         texts = [p.searchable_text[:6000] for p in batch_pages]
-        
+
         try:
             return self._get_batch_embeddings(texts)
         except (requests.exceptions.RequestException, Exception) as e:
             if current_batch_size <= 1:
                 logger.error(f"Atomic embedding failure for {batch_pages[0].page_id}: {e}")
-                return [[0.0] * 768]
-            
+                return [[0.0] * DEFAULT_CONFIG.embedding.dimension]
+
             new_size = max(1, current_batch_size // 2)
             logger.warning(f"Ollama pressure detected. Scaling down: {current_batch_size} -> {new_size}")
-            
+
             # Split and recurse
             mid = len(batch_pages) // 2
-            left_batch = batch_pages[:mid]
-            right_batch = batch_pages[mid:]
-            
-            left_embs = self._safe_embed_batch(left_batch, new_size)
-            right_embs = self._safe_embed_batch(right_batch, new_size)
-            
+            left_embs = self._safe_embed_batch(batch_pages[:mid], new_size)
+            right_embs = self._safe_embed_batch(batch_pages[mid:], new_size)
+
             return left_embs + right_embs
 
     def build(self, pages: List[CodePage], batch_size: int = None):
         if self._impl:
             return self._impl.build(pages, batch_size)
-            
+
         cfg = DEFAULT_CONFIG.embedding
         batch_size = batch_size or cfg.batch_size
         max_workers = cfg.max_workers
-        
+
         # Silence noisy HTTP logs
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("requests").setLevel(logging.WARNING)
         logging.getLogger("urllib3").setLevel(logging.WARNING)
-            
-        # Clear existing collection
+
+        # Clear existing collection efficiently — delete + recreate instead of
+        # fetching all IDs into memory (which can OOM on 100K+ pages)
         try:
-            if self._collection.count() > 0:
-                self._collection.delete(ids=self._collection.get()["ids"])
-        except:
-            pass
+            self._client.delete_collection(self._collection_name)
+            self._collection = self._client.get_or_create_collection(
+                name=self._collection_name,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._embed_fn,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to clear collection: {e}")
 
         self._pages_map = {p.page_id: p for p in pages}
         self._save_map()
 
         start = time.perf_counter()
-        
+
         # Prepare batches
         batches = []
         for i in range(0, len(pages), batch_size):
@@ -148,46 +153,49 @@ class VectorCodeIndex:
             console=logging.getLogger("code_graph_rag").handlers[0].console if logging.getLogger("code_graph_rag").handlers else None
         ) as progress:
             task = progress.add_task(f"[cyan]Embedding {len(pages)} pages (Turbo Mode, {max_workers} threads)...", total=len(pages))
-            
+
             def process_batch(batch_pages):
                 embeddings = self._safe_embed_batch(batch_pages, len(batch_pages))
                 texts = [p.searchable_text[:6000] for p in batch_pages]
-                
-                self._collection.add(
-                    ids=[p.page_id for p in batch_pages],
-                    embeddings=embeddings,
-                    documents=texts,
-                    metadatas=[
-                        {
-                            "symbol_name": p.symbol_name,
-                            "symbol_type": p.symbol_type,
-                            "file_path": p.file_path,
-                            "line_start": p.line_start,
-                            "line_end": p.line_end,
-                        }
-                        for p in batch_pages
-                    ],
-                )
+
+                # Thread-safe ChromaDB write — PersistentClient is NOT safe for
+                # concurrent writes, so we serialize add() calls with a lock.
+                with self._write_lock:
+                    self._collection.add(
+                        ids=[p.page_id for p in batch_pages],
+                        embeddings=embeddings,
+                        documents=texts,
+                        metadatas=[
+                            {
+                                "symbol_name": p.symbol_name,
+                                "symbol_type": p.symbol_type,
+                                "file_path": p.file_path,
+                                "line_start": p.line_start,
+                                "line_end": p.line_end,
+                            }
+                            for p in batch_pages
+                        ],
+                    )
                 progress.update(task, advance=len(batch_pages))
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 executor.map(process_batch, batches)
-                
+
         logger.info(f"Built Chroma vector index (Parallel) in {time.perf_counter() - start:.1f}s")
 
     def search(self, query: str, top_k: int = 10) -> List[ScoredPage]:
         if self._impl:
             return self._impl.search(query, top_k)
-            
+
         try:
             # Truncate query too
             results = self._collection.query(query_texts=[query[:6000]], n_results=top_k)
             scored_pages = []
-            
+
             if results and results["ids"] and results["ids"][0]:
                 ids = results["ids"][0]
                 distances = results["distances"][0] if results["distances"] else [0.0] * len(ids)
-                
+
                 for pid, dist in zip(ids, distances):
                     page = self._pages_map.get(pid)
                     if page:

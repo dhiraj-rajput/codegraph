@@ -1,9 +1,10 @@
 """
 BM25 index for code pages.
 
-Uses rank-bm25 with code-aware tokenization (splits camelCase, snake_case,
-preserves identifiers). This is the primary sparse retrieval algorithm
-for the vectorless RAG pipeline.
+Uses bm25s (sparse matrix BM25) for up to 500x faster scoring than rank-bm25.
+Falls back to rank-bm25 if bm25s is not installed.
+
+Code-aware tokenization: splits camelCase, snake_case, preserves identifiers.
 """
 
 import re
@@ -12,11 +13,19 @@ import pickle
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-from rank_bm25 import BM25Okapi
-
 from indexer.page_index import CodePage
 
 logger = logging.getLogger(__name__)
+
+# Try bm25s first (500x faster via sparse matrices), fall back to rank-bm25
+try:
+    import bm25s
+    BM25S_AVAILABLE = True
+    logger.debug("Using bm25s (fast sparse BM25)")
+except ImportError:
+    BM25S_AVAILABLE = False
+    from rank_bm25 import BM25Okapi
+    logger.debug("bm25s not installed, using rank-bm25 (slower)")
 
 
 @dataclass
@@ -44,6 +53,7 @@ CODE_STOPWORDS = {
 _CAMEL_PATTERN = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
 _SNAKE_PATTERN = re.compile(r'_+')
 _NONALPHA = re.compile(r'[^a-zA-Z0-9_]')
+_SPLIT_PATTERN = re.compile(r'[\s\(\)\{\}\[\]:,;=\+\-\*/\<\>\!\&\|\^\~\%\#\"\'\`]+')
 
 
 def tokenize_code(text: str) -> List[str]:
@@ -60,7 +70,7 @@ def tokenize_code(text: str) -> List[str]:
     tokens = []
 
     # Basic split on whitespace and punctuation
-    words = re.split(r'[\s\(\)\{\}\[\]:,;=\+\-\*/\<\>\!\&\|\^\~\%\#\"\'\`]+', text)
+    words = _SPLIT_PATTERN.split(text)
 
     for word in words:
         if not word:
@@ -101,14 +111,17 @@ class BM25CodeIndex:
     """
     BM25 index over code pages.
 
-    Documents are function-level code pages with code-aware tokenization.
-    Supports both BM25Okapi (standard) retrieval.
+    Supports two backends:
+    - bm25s (preferred): Uses SciPy sparse matrices for 500x faster scoring.
+      Pre-computes all BM25 term-document scores at index time.
+    - rank-bm25 (fallback): Standard BM25Okapi if bm25s is not installed.
     """
 
     def __init__(self):
-        self._bm25: Optional[BM25Okapi] = None
+        self._bm25 = None
         self._pages: List[CodePage] = []
         self._tokenized_corpus: List[List[str]] = []
+        self._use_bm25s = BM25S_AVAILABLE
 
     def build(self, pages: List[CodePage]):
         """
@@ -120,8 +133,20 @@ class BM25CodeIndex:
         self._tokenized_corpus = [
             tokenize_code(page.searchable_text) for page in pages
         ]
-        self._bm25 = BM25Okapi(self._tokenized_corpus)
-        logger.info(f"Built BM25 index with {len(pages)} pages")
+
+        if self._use_bm25s:
+            # bm25s: pre-compute sparse score matrix at index time
+            self._bm25 = bm25s.BM25()
+            # bm25s expects a corpus as list of lists of strings
+            self._bm25.index(bm25s.tokenize(
+                [page.searchable_text for page in pages],
+                stopwords=list(CODE_STOPWORDS),
+            ))
+        else:
+            self._bm25 = BM25Okapi(self._tokenized_corpus)
+
+        logger.info(f"Built BM25 index with {len(pages)} pages"
+                     f" (backend={'bm25s' if self._use_bm25s else 'rank-bm25'})")
 
     def search(self, query: str, top_k: int = 10) -> List[ScoredPage]:
         """
@@ -133,45 +158,73 @@ class BM25CodeIndex:
             logger.warning("BM25 index not built yet")
             return []
 
-        query_tokens = tokenize_code(query)
-        if not query_tokens:
-            return []
+        if self._use_bm25s:
+            query_tokens = bm25s.tokenize(query, stopwords=list(CODE_STOPWORDS))
+            results, scores = self._bm25.retrieve(query_tokens, k=min(top_k, len(self._pages)))
 
-        scores = self._bm25.get_scores(query_tokens)
+            scored = []
+            for i in range(results.shape[1]):
+                idx = int(results[0, i])
+                score = float(scores[0, i])
+                if score > 0 and idx < len(self._pages):
+                    scored.append(ScoredPage(
+                        page=self._pages[idx],
+                        score=score,
+                        source="bm25",
+                    ))
+            return scored
+        else:
+            # rank-bm25 fallback
+            query_tokens = tokenize_code(query)
+            if not query_tokens:
+                return []
 
-        # Get top-k indices
-        scored_indices = sorted(
-            enumerate(scores), key=lambda x: x[1], reverse=True
-        )[:top_k]
+            scores = self._bm25.get_scores(query_tokens)
 
-        results = []
-        for idx, score in scored_indices:
-            if score > 0:
-                results.append(ScoredPage(
-                    page=self._pages[idx],
-                    score=float(score),
-                    source="bm25",
-                ))
+            # Get top-k indices
+            scored_indices = sorted(
+                enumerate(scores), key=lambda x: x[1], reverse=True
+            )[:top_k]
 
-        return results
+            results = []
+            for idx, score in scored_indices:
+                if score > 0:
+                    results.append(ScoredPage(
+                        page=self._pages[idx],
+                        score=float(score),
+                        source="bm25",
+                    ))
+
+            return results
 
     def get_scores(self, query: str) -> List[Tuple[str, float]]:
         """Get BM25 scores for all pages (for hybrid fusion)."""
         if self._bm25 is None:
             return []
 
-        query_tokens = tokenize_code(query)
-        if not query_tokens:
-            return []
-
-        scores = self._bm25.get_scores(query_tokens)
-        return [(self._pages[i].page_id, float(s)) for i, s in enumerate(scores)]
+        if self._use_bm25s:
+            query_tokens = bm25s.tokenize(query, stopwords=list(CODE_STOPWORDS))
+            results, scores = self._bm25.retrieve(query_tokens, k=min(100, len(self._pages)))
+            output = []
+            for i in range(results.shape[1]):
+                idx = int(results[0, i])
+                score = float(scores[0, i])
+                if idx < len(self._pages):
+                    output.append((self._pages[idx].page_id, score))
+            return output
+        else:
+            query_tokens = tokenize_code(query)
+            if not query_tokens:
+                return []
+            scores = self._bm25.get_scores(query_tokens)
+            return [(self._pages[i].page_id, float(s)) for i, s in enumerate(scores)]
 
     def save(self, path: str):
         """Save BM25 index to disk."""
         data = {
             "tokenized_corpus": self._tokenized_corpus,
             "pages": self._pages,
+            "use_bm25s": self._use_bm25s,
         }
         with open(path, "wb") as f:
             pickle.dump(data, f)
@@ -182,7 +235,16 @@ class BM25CodeIndex:
             data = pickle.load(f)
         self._pages = data["pages"]
         self._tokenized_corpus = data["tokenized_corpus"]
-        self._bm25 = BM25Okapi(self._tokenized_corpus)
+        self._use_bm25s = data.get("use_bm25s", False) and BM25S_AVAILABLE
+
+        if self._use_bm25s:
+            self._bm25 = bm25s.BM25()
+            self._bm25.index(bm25s.tokenize(
+                [page.searchable_text for page in self._pages],
+                stopwords=list(CODE_STOPWORDS),
+            ))
+        else:
+            self._bm25 = BM25Okapi(self._tokenized_corpus)
 
     @property
     def page_count(self) -> int:

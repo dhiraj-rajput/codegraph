@@ -6,6 +6,7 @@ functions, classes, imports, and other code constructs.
 """
 
 import os
+import re
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -283,7 +284,7 @@ class CodeParser:
                     if t_node:
                         t_text = t_node.text.decode("utf-8")
                         # Handle Optional[Foo], Union[Foo, Bar] by just grabbing words
-                        import re
+                        # re is already imported at module level
                         types = re.findall(r'[a-zA-Z_]\w*', t_text)
                         for t in types:
                             if t not in ("Optional", "Union", "List", "Dict", "Set", "Tuple", "str", "int", "float", "bool", "Any"):

@@ -7,15 +7,14 @@ import os
 import pickle
 import numpy as np
 import logging
-from typing import List, Dict, Optional, Union
+import time
+from typing import List, Dict, Optional
+
 from indexer.page_index import CodePage
 from indexer.bm25_index import ScoredPage
 from config.settings import DEFAULT_CONFIG, OLLAMA_HOST
 from concurrent.futures import ThreadPoolExecutor
 import requests
-import urllib.request
-import json
-import time
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 
@@ -36,11 +35,11 @@ class NumpyVectorIndex:
         self._persist_dir = persist_dir
         self._model_name = model_name or DEFAULT_CONFIG.embedding.model_name
         self._save_path = os.path.join(persist_dir, f"{collection_name}_numpy.pkl")
-        
+
         self.embeddings: Optional[np.ndarray] = None
         self.page_ids: List[str] = []
         self.pages_map: Dict[str, CodePage] = {}
-        
+
         if os.path.exists(self._save_path):
             self.load()
 
@@ -60,11 +59,11 @@ class NumpyVectorIndex:
         except Exception as e:
             if current_batch_size <= 1:
                 logger.error(f"Atomic embedding failure: {e}")
-                return [[0.0] * 768]
-            
+                return [[0.0] * DEFAULT_CONFIG.embedding.dimension]
+
             new_size = max(1, current_batch_size // 2)
             logger.warning(f"Ollama pressure (Numpy). Scaling down: {current_batch_size} -> {new_size}")
-            
+
             mid = len(batch_pages) // 2
             return self._safe_embed_batch(batch_pages[:mid], new_size) + self._safe_embed_batch(batch_pages[mid:], new_size)
 
@@ -72,17 +71,17 @@ class NumpyVectorIndex:
         cfg = DEFAULT_CONFIG.embedding
         batch_size = batch_size or cfg.batch_size
         max_workers = cfg.max_workers
-        
+
         start = time.perf_counter()
         self.page_ids = []
         self.pages_map = {}
         embeddings_list = [None] * len(pages)
-        
+
         # Mapping for progress tracking
         batches = []
         for i in range(0, len(pages), batch_size):
             batches.append((i, pages[i:i + batch_size]))
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -92,14 +91,14 @@ class NumpyVectorIndex:
             console=logging.getLogger("code_graph_rag").handlers[0].console if logging.getLogger("code_graph_rag").handlers else None
         ) as progress:
             task = progress.add_task(f"[cyan]Building Numpy index (Turbo Mode, {max_workers} threads)...", total=len(pages))
-            
+
             def process_batch(batch_info):
                 idx, batch_pages = batch_info
                 batch_embeddings = self._safe_embed_batch(batch_pages, len(batch_pages))
-                
+
                 for i, emb in enumerate(batch_embeddings):
                     embeddings_list[idx + i] = emb
-                    
+
                 progress.update(task, advance=len(batch_pages))
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -109,27 +108,28 @@ class NumpyVectorIndex:
         for p in pages:
             self.page_ids.append(p.page_id)
             self.pages_map[p.page_id] = p
-        
+
         self.embeddings = np.array(embeddings_list)
         # Normalize for cosine similarity
         norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
         self.embeddings = self.embeddings / (norms + 1e-9)
-        
+
         self.save()
         logger.info(f"Built Numpy vector index (Parallel) in {time.perf_counter() - start:.1f}s")
 
     def search(self, query: str, top_k: int = 10) -> List[ScoredPage]:
         if self.embeddings is None:
             return []
-            
-        q_embs = self._get_ollama_embeddings(query)
+
+        # FIX: was calling non-existent self._get_ollama_embeddings()
+        q_embs = self._get_batch_embeddings([query[:6000]])
         q_emb = np.array(q_embs[0])
         q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-9)
-        
+
         # Cosine similarity (dot product of normalized vectors)
         similarities = np.dot(self.embeddings, q_emb)
         top_indices = np.argsort(similarities)[::-1][:top_k]
-        
+
         results = []
         for idx in top_indices:
             pid = self.page_ids[idx]

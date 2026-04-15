@@ -6,7 +6,6 @@ All paths and Ollama model settings are centralized here.
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
@@ -42,14 +41,13 @@ class EmbeddingConfig:
     batch_size: int = 100
     max_workers: int = os.cpu_count() or 4   # Dynamic workers based on CPU cores
 
-    
+
 @dataclass
 class LLMConfig:
-    """Configuration for local Ollama LLM inference."""
-    provider: str = "ollama"
+    """Configuration for local Ollama LLM inference. Ollama-only."""
     model_name: str = "llama3.2"             # Fast and excellent general purpose/code reasoning
     fast_model_name: str = "llama3.2"        # Quick rewrites etc.
-    
+
     enable_query_expansion: bool = True      # Rewrites vague queries
     temperature: float = 0.0
     max_tokens: int = 2048

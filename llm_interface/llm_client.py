@@ -5,6 +5,7 @@ Handles prompt formatting, API calls, and response parsing.
 """
 
 import json
+import time
 import logging
 from typing import Optional, Dict
 from dataclasses import dataclass
@@ -57,7 +58,6 @@ class LLMClient:
         """
         Send a query to the local Ollama provider.
         """
-        import time
         start = time.perf_counter()
 
         temp = temperature if temperature is not None else self.config.temperature
